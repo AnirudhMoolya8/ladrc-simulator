@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PID vs LADRC Real-Time Simulator</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React and ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Recharts -->
+    <script src="https://unpkg.com/recharts@2.5.0/dist/Recharts.js"></script>
+    
+    <!-- Lucide Icons (we'll use text symbols instead for simplicity) -->
+    
+    <style>
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
+
+        const LADRCSimulator = () => {
+          // Simulation parameters
+          const [params, setParams] = useState({
+            wn: 1.0,
+            zeta: 0.2,
+            b: 1.0,
+            Kp: 8.0,
+            Ki: 1.5,
+            Kd: 3.0,
+            tau_d: 0.05,
+            wc: 2.0,
+            wo: 30.0,
+            b0: 1.0,
+            distMag: 2.0,
+            distTime: 2.0,
+            speed: 1.0,
+            Tend: 10.0
+          });
+
+          const [isRunning, setIsRunning] = useState(false);
+          const [simState, setSimState] = useState({
+            t: 0,
+            pidState: [0, 0],
+            ladrcState: [0, 0],
+            xhat: [0, 0, 0],
+            pidIntegral: 0,
+            pidePrev: 0,
+            pideDotFilt: 0,
+            chartData: []
+          });
+
+          const animationRef = useRef(null);
+          const lastUpdateRef = useRef(0);
+
+          // Derived parameters
+          const a1 = -(params.wn ** 2);
+          const a2 = -2.0 * params.zeta * params.wn;
+          const beta1 = 3.0 * params.wo;
+          const beta2 = 3.0 * (params.wo ** 2);
+          const beta3 = params.wo ** 3;
+
+          const disturbance = (t) => {
+            return t >= params.distTime ? params.distMag : 0.0;
+          };
+
+          const plantDerivatives = (state, u, t) => {
+            const [y, yDot] = state;
+            const d = disturbance(t);
+            const yDdot = a1 * y + a2 * yDot + params.b * u + d;
+            return [yDot, yDdot];
+          };
+
+          const rk4Step = (f, state, u, t, dt) => {
+            const k1 = f(state, u, t);
+            const k2 = f([state[0] + 0.5 * dt * k1[0], state[1] + 0.5 * dt * k1[1]], u, t + 0.5 * dt);
+            const k3 = f([state[0] + 0.5 * dt * k2[0], state[1] + 0.5 * dt * k2[1]], u, t + 0.5 * dt);
+            const k4 = f([state[0] + dt * k3[0], state[1] + dt * k3[1]], u, t + dt);
+            
+            return [
+              state[0] + (dt / 6.0) * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]),
+              state[1] + (dt / 6.0) * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
+            ];
+          };
+
+          const pidControl = (e, eDotFilt, eInt) => {
+            return params.Kp * e + params.Ki * eInt + params.Kd * eDotFilt;
+          };
+
+          const lesoDerivatives = (xHat, yMeas, u) => {
+            const [x1, x2, x3] = xHat;
+            const e = yMeas - x1;
+            
+            const dx1 = x2 + beta1 * e;
+            const dx2 = a1 * x1 + a2 * x2 + params.b0 * u + x3 + beta2 * e;
+            const dx3 = beta3 * e;
+            
+            return [dx1, dx2, dx3];
+          };
+
+          const ladrcControl = (xHat, r, rDot, rDdot) => {
+            const kp = params.wc ** 2;
+            const kd = 2.0 * params.wc;
+            const [x1, x2, x3] = xHat;
+            
+            const v = rDdot - kp * (x1 - r) - kd * (x2 - rDot);
+            const u = (v - a1 * x1 - a2 * x2 - x3) / params.b0;
+            
+            return u;
+          };
+
+          const simulationStep = (currentState) => {
+            const dt = 0.001;
+            const t = currentState.t;
+            const r = 1.0;
+            const rDot = 0.0;
+            const rDdot = 0.0;
+
+            const [yPid, yDotPid] = currentState.pidState;
+            const ePid = r - yPid;
+            
+            let newPidIntegral = currentState.pidIntegral + ePid * dt;
+            newPidIntegral = Math.max(-5.0, Math.min(5.0, newPidIntegral));
+            
+            const eDotRaw = (ePid - currentState.pidePrev) / dt;
+            const alpha = params.tau_d / (params.tau_d + dt);
+            const newEDotFilt = alpha * currentState.pideDotFilt + (1 - alpha) * eDotRaw;
+            
+            const uPid = pidControl(ePid, newEDotFilt, newPidIntegral);
+            const newPidState = rk4Step(plantDerivatives, currentState.pidState, uPid, t, dt);
+
+            const [yLadrc, yDotLadrc] = currentState.ladrcState;
+            const uLadrc = ladrcControl(currentState.xhat, r, rDot, rDdot);
+            
+            const dxhat = lesoDerivatives(currentState.xhat, yLadrc, uLadrc);
+            const newXhat = [
+              currentState.xhat[0] + dxhat[0] * dt,
+              currentState.xhat[1] + dxhat[1] * dt,
+              currentState.xhat[2] + dxhat[2] * dt
+            ];
+            
+            const newLadrcState = rk4Step(plantDerivatives, currentState.ladrcState, uLadrc, t, dt);
+
+            const shouldStore = currentState.chartData.length === 0 || (t - currentState.chartData[currentState.chartData.length - 1].t) >= 0.01;
+            
+            const newChartData = shouldStore 
+              ? [...currentState.chartData, {
+                  t: parseFloat(t.toFixed(3)),
+                  ref: r,
+                  yPid: parseFloat(yPid.toFixed(4)),
+                  yLadrc: parseFloat(yLadrc.toFixed(4)),
+                  uPid: parseFloat(uPid.toFixed(4)),
+                  uLadrc: parseFloat(uLadrc.toFixed(4)),
+                  d: parseFloat(disturbance(t).toFixed(4)),
+                  x3: parseFloat(currentState.xhat[2].toFixed(4))
+                }]
+              : currentState.chartData;
+
+            const trimmedData = newChartData.length > 1000 ? newChartData.slice(-1000) : newChartData;
+
+            return {
+              t: t + dt,
+              pidState: newPidState,
+              ladrcState: newLadrcState,
+              xhat: newXhat,
+              pidIntegral: newPidIntegral,
+              pidePrev: ePid,
+              pideDotFilt: newEDotFilt,
+              chartData: trimmedData
+            };
+          };
+
+          useEffect(() => {
+            if (!isRunning) return;
+
+            const animate = (timestamp) => {
+              if (!lastUpdateRef.current) lastUpdateRef.current = timestamp;
+              const elapsed = timestamp - lastUpdateRef.current;
+
+              if (elapsed >= 16) {
+                setSimState(currentState => {
+                  if (currentState.t >= params.Tend) {
+                    setIsRunning(false);
+                    return currentState;
+                  }
+                  
+                  const stepsPerFrame = Math.ceil(16 * params.speed);
+                  
+                  let newState = currentState;
+                  for (let i = 0; i < stepsPerFrame; i++) {
+                    if (newState.t >= params.Tend) break;
+                    newState = simulationStep(newState);
+                  }
+                  return newState;
+                });
+                
+                lastUpdateRef.current = timestamp;
+              }
+
+              animationRef.current = requestAnimationFrame(animate);
+            };
+
+            animationRef.current = requestAnimationFrame(animate);
+
+            return () => {
+              if (animationRef.current) {
+                cancelAnimationFrame(animationRef.current);
+              }
+            };
+          }, [isRunning, params]);
+
+          const resetSimulation = () => {
+            setIsRunning(false);
+            setSimState({
+              t: 0,
+              pidState: [0, 0],
+              ladrcState: [0, 0],
+              xhat: [0, 0, 0],
+              pidIntegral: 0,
+              pidePrev: 0,
+              pideDotFilt: 0,
+              chartData: []
+            });
+            lastUpdateRef.current = 0;
+          };
+
+          const updateParam = (key, value) => {
+            setParams(prev => ({ ...prev, [key]: parseFloat(value) || 0 }));
+          };
+
+          return (
+            <div className="w-full min-h-screen bg-gray-900 text-white flex flex-col lg:flex-row">
+              <div className="w-full lg:w-80 bg-gray-800 p-4 overflow-y-auto border-b lg:border-b-0 lg:border-r border-gray-700">
+                <h1 className="text-2xl font-bold mb-4 text-blue-400">PID vs LADRC</h1>
+                
+                <div className="mb-6 space-y-2">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setIsRunning(!isRunning)}
+                      className="flex-1 bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded transition-colors"
+                    >
+                      {isRunning ? '⏸ Pause' : '▶ Play'}
+                    </button>
+                    <button
+                      onClick={resetSimulation}
+                      className="bg-red-600 hover:bg-red-700 px-4 py-2 rounded transition-colors"
+                    >
+                      ↻ Reset
+                    </button>
+                  </div>
+                  <div className="text-center text-sm text-gray-400">
+                    Time: {simState.t.toFixed(2)}s / {params.Tend}s
+                  </div>
+                </div>
+
+                <div className="mb-6">
+                  <label className="block text-sm font-medium mb-1">Speed: {params.speed}x</label>
+                  <input
+                    type="range"
+                    min="0.1"
+                    max="5"
+                    step="0.1"
+                    value={params.speed}
+                    onChange={(e) => updateParam('speed', e.target.value)}
+                    className="w-full"
+                  />
+                </div>
+
+                <div className="mb-4">
+                  <h2 className="text-lg font-semibold mb-2 text-green-400">Plant Parameters</h2>
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <label className="block">ωₙ: {params.wn.toFixed(2)}</label>
+                      <input type="range" min="0.5" max="3" step="0.1" value={params.wn}
+                        onChange={(e) => updateParam('wn', e.target.value)} className="w-full" />
+                    </div>
+                    <div>
+                      <label className="block">ζ: {params.zeta.toFixed(2)}</label>
+                      <input type="range" min="0.1" max="1" step="0.05" value={params.zeta}
+                        onChange={(e) => updateParam('zeta', e.target.value)} className="w-full" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <h2 className="text-lg font-semibold mb-2 text-yellow-400">PID Gains</h2>
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <label className="block">Kp: {params.Kp.toFixed(1)}</label>
+                      <input type="range" min="0" max="20" step="0.5" value={params.Kp}
+                        onChange={(e) => updateParam('Kp', e.target.value)} className="w-full" />
+                    </div>
+                    <div>
+                      <label className="block">Ki: {params.Ki.toFixed(1)}</label>
+                      <input type="range" min="0" max="5" step="0.1" value={params.Ki}
+                        onChange={(e) => updateParam('Ki', e.target.value)} className="w-full" />
+                    </div>
+                    <div>
+                      <label className="block">Kd: {params.Kd.toFixed(1)}</label>
+                      <input type="range" min="0" max="10" step="0.5" value={params.Kd}
+                        onChange={(e) => updateParam('Kd', e.target.value)} className="w-full" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <h2 className="text-lg font-semibold mb-2 text-purple-400">LADRC Bandwidths</h2>
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <label className="block">ωc: {params.wc.toFixed(1)}</label>
+                      <input type="range" min="0.5" max="10" step="0.5" value={params.wc}
+                        onChange={(e) => updateParam('wc', e.target.value)} className="w-full" />
+                    </div>
+                    <div>
+                      <label className="block">ω₀: {params.wo.toFixed(1)}</label>
+                      <input type="range" min="5" max="50" step="1" value={params.wo}
+                        onChange={(e) => updateParam('wo', e.target.value)} className="w-full" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <h2 className="text-lg font-semibold mb-2 text-red-400">Disturbance</h2>
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <label className="block">Magnitude: {params.distMag.toFixed(1)}</label>
+                      <input type="range" min="0" max="5" step="0.5" value={params.distMag}
+                        onChange={(e) => updateParam('distMag', e.target.value)} className="w-full" />
+                    </div>
+                    <div>
+                      <label className="block">Time: {params.distTime.toFixed(1)}s</label>
+                      <input type="range" min="0" max="8" step="0.5" value={params.distTime}
+                        onChange={(e) => updateParam('distTime', e.target.value)} className="w-full" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex-1 p-4 overflow-y-auto space-y-4">
+                <div className="bg-gray-800 p-4 rounded-lg">
+                  <h3 className="text-lg font-semibold mb-2">Step Response</h3>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <LineChart data={simState.chartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis 
+                        dataKey="t" 
+                        label={{ value: 'Time [s]', position: 'insideBottom', offset: -5 }}
+                        stroke="#9ca3af"
+                      />
+                      <YAxis stroke="#9ca3af" />
+                      <Tooltip 
+                        contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
+                        labelStyle={{ color: '#fff' }}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="ref" stroke="#6b7280" strokeDasharray="5 5" name="Reference" dot={false} />
+                      <Line type="monotone" dataKey="yPid" stroke="#fbbf24" name="PID" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="yLadrc" stroke="#a78bfa" name="LADRC" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div className="bg-gray-800 p-4 rounded-lg">
+                  <h3 className="text-lg font-semibold mb-2">Control Effort</h3>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <LineChart data={simState.chartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis 
+                        dataKey="t" 
+                        label={{ value: 'Time [s]', position: 'insideBottom', offset: -5 }}
+                        stroke="#9ca3af"
+                      />
+                      <YAxis stroke="#9ca3af" />
+                      <Tooltip 
+                        contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
+                        labelStyle={{ color: '#fff' }}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="uPid" stroke="#fbbf24" name="u_PID" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="uLadrc" stroke="#a78bfa" name="u_LADRC" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div className="bg-gray-800 p-4 rounded-lg">
+                  <h3 className="text-lg font-semibold mb-2">Disturbance Estimation</h3>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <LineChart data={simState.chartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis 
+                        dataKey="t" 
+                        label={{ value: 'Time [s]', position: 'insideBottom', offset: -5 }}
+                        stroke="#9ca3af"
+                      />
+                      <YAxis stroke="#9ca3af" />
+                      <Tooltip 
+                        contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
+                        labelStyle={{ color: '#fff' }}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="d" stroke="#ef4444" name="True d(t)" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="x3" stroke="#10b981" name="LESO x₃" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        ReactDOM.render(<LADRCSimulator />, document.getElementById('root'));
+    </script>
+</body>
+</html>
